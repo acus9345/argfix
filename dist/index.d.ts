@@ -33,7 +33,7 @@ export interface CoerceOptions {
 /** The part of Standard Schema that argfix uses. Zod, Valibot, ArkType and others all have it. */
 export interface StandardSchema {
     "~standard": {
-        validate(value: unknown): StandardResult | Promise<StandardResult>;
+        validate(value: unknown): StandardResult | PromiseLike<StandardResult>;
     };
 }
 interface StandardResult {

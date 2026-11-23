@@ -13,7 +13,7 @@ export function coerceSync(schema, value, options = {}) {
     let step = steps.next();
     while (!step.done) {
         const checked = step.value;
-        if (checked instanceof Promise)
+        if (isThenable(checked))
             throw new TypeError("This schema validates asynchronously. Use coerce() instead");
         step = steps.next(checked);
     }
@@ -24,15 +24,18 @@ function checker(schema) {
     if (!isStandard)
         return (value) => ({ problems: checkJsonSchema(schema, value) });
     const { validate } = schema["~standard"];
-    const read = (result) => (result.issues ? { problems: result.issues.map(problem) } : { problems: [], output: result.value });
+    const read = (result) => (result.issues && result.issues.length > 0 ? { problems: result.issues.map(problem) } : { problems: [], output: result.value });
     return (value) => {
         const result = validate(value);
-        return result instanceof Promise ? result.then(read) : read(result);
+        return isThenable(result) ? result.then(read) : read(result);
     };
 }
+function isThenable(value) {
+    return (typeof value === "object" || typeof value === "function") && value !== null && typeof value.then === "function";
+}
 function problem(issue) {
-    const path = (issue.path ?? []).map((part) => (typeof part === "object" ? part.key : part));
-    return { path: path.filter((part) => typeof part !== "symbol"), message: issue.message };
+    const path = (issue.path ?? []).map((part) => (typeof part === "object" && part !== null ? part.key : part));
+    return { path: path.filter((part) => typeof part === "string" || typeof part === "number"), message: issue.message };
 }
 /**
  * Tries a fix at each place the schema complains about, and keeps the ones that clear the
@@ -52,7 +55,8 @@ function* repair(check, input, options) {
             if (!path)
                 continue;
             const from = getAt(value, path);
-            for (const candidate of candidates(from, issue, typeof path.at(-1) === "string")) {
+            const isProperty = path.length > 0 && !Array.isArray(getAt(value, path.slice(0, -1)));
+            for (const candidate of candidates(from, issue, isProperty)) {
                 if (skip.has(candidate.rule))
                     continue;
                 const next = candidate.drop ? removeAt(value, path) : setAt(value, path, candidate.value);
@@ -89,7 +93,10 @@ function reachable(root, path) {
     for (let i = 0; i < path.length; i++) {
         if (typeof node !== "object" || node === null)
             return path.slice(0, i);
-        node = node[path[i]];
+        const key = path[i];
+        if (!Object.hasOwn(node, key))
+            return undefined;
+        node = node[key];
     }
     return node === undefined ? undefined : path;
 }
@@ -125,10 +132,21 @@ function candidates(value, issue, isProperty) {
         return [{ rule: "boolean-to-string", value: String(value) }, wrap];
     if (value === null)
         return isProperty ? [{ rule: "drop-null", value: undefined, drop: true }] : [];
+    const json = toJsonString(value);
+    const asJson = json === undefined ? [] : [{ rule: "to-json-string", value: json }];
     if (Array.isArray(value)) {
-        return [...(value.length === 1 ? [{ rule: "unwrap-array", value: value[0] }] : []), { rule: "to-json-string", value: JSON.stringify(value) }];
+        return [...(value.length === 1 ? [{ rule: "unwrap-array", value: value[0] }] : []), ...asJson];
     }
-    return [wrap, { rule: "to-json-string", value: JSON.stringify(value) }];
+    return [wrap, ...asJson];
+}
+function toJsonString(value) {
+    try {
+        const json = JSON.stringify(value);
+        return typeof json === "string" ? json : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 function stringCandidates(value, issue, isProperty, wrap) {
     const text = value.trim();
@@ -162,7 +180,7 @@ function stringCandidates(value, issue, isProperty, wrap) {
 function enumMatches(text, issue) {
     const key = (item) => item.toLowerCase().replace(/[\s_-]+/g, "");
     if (issue.enum)
-        return issue.enum.filter((item) => typeof item === "string" && key(item) === key(text));
+        return issue.enum.filter((item) => typeof item === "string" && item !== text && key(item) === key(text));
     const words = text.split(/[\s_-]+/);
     const forms = [text.toLowerCase(), text.toUpperCase(), text.charAt(0).toUpperCase() + text.slice(1).toLowerCase(), words.join("_").toLowerCase(), words.join("-").toLowerCase(), words.join("_").toUpperCase()];
     return [...new Set(forms)].filter((form) => form !== text);

@@ -54,7 +54,7 @@ export interface CoerceOptions {
 /** The part of Standard Schema that argfix uses. Zod, Valibot, ArkType and others all have it. */
 export interface StandardSchema {
   "~standard": {
-    validate(value: unknown): StandardResult | Promise<StandardResult>;
+    validate(value: unknown): StandardResult | PromiseLike<StandardResult>;
   };
 }
 
@@ -76,7 +76,7 @@ interface Candidate {
   drop?: boolean;
 }
 
-type Check = (value: unknown) => Checked | Promise<Checked>;
+type Check = (value: unknown) => Checked | PromiseLike<Checked>;
 
 /** Fix `value` to match `schema`. Takes any Standard Schema or a JSON Schema. */
 export async function coerce(schema: StandardSchema | JsonSchema, value: unknown, options: CoerceOptions = {}): Promise<CoerceResult> {
@@ -92,7 +92,7 @@ export function coerceSync(schema: StandardSchema | JsonSchema, value: unknown, 
   let step = steps.next();
   while (!step.done) {
     const checked = step.value;
-    if (checked instanceof Promise) throw new TypeError("This schema validates asynchronously. Use coerce() instead");
+    if (isThenable<Checked>(checked)) throw new TypeError("This schema validates asynchronously. Use coerce() instead");
     step = steps.next(checked);
   }
   return step.value;
@@ -102,16 +102,20 @@ function checker(schema: StandardSchema | JsonSchema): Check {
   const isStandard = (typeof schema === "object" || typeof schema === "function") && schema !== null && "~standard" in schema;
   if (!isStandard) return (value) => ({ problems: checkJsonSchema(schema as JsonSchema, value) });
   const { validate } = (schema as StandardSchema)["~standard"];
-  const read = (result: StandardResult): Checked => (result.issues ? { problems: result.issues.map(problem) } : { problems: [], output: result.value });
+  const read = (result: StandardResult): Checked => (result.issues && result.issues.length > 0 ? { problems: result.issues.map(problem) } : { problems: [], output: result.value });
   return (value) => {
     const result = validate(value);
-    return result instanceof Promise ? result.then(read) : read(result);
+    return isThenable<StandardResult>(result) ? result.then(read) : read(result);
   };
 }
 
+function isThenable<T>(value: unknown): value is PromiseLike<T> {
+  return (typeof value === "object" || typeof value === "function") && value !== null && typeof (value as { then?: unknown }).then === "function";
+}
+
 function problem(issue: NonNullable<StandardResult["issues"]>[number]): Problem {
-  const path = (issue.path ?? []).map((part) => (typeof part === "object" ? part.key : part));
-  return { path: path.filter((part) => typeof part !== "symbol") as Path, message: issue.message };
+  const path = (issue.path ?? []).map((part) => (typeof part === "object" && part !== null ? part.key : part));
+  return { path: path.filter((part): part is string | number => typeof part === "string" || typeof part === "number"), message: issue.message };
 }
 
 /**
@@ -119,7 +123,7 @@ function problem(issue: NonNullable<StandardResult["issues"]>[number]): Problem 
  * complaint without causing a new one elsewhere. Because the schema judges every attempt, this
  * needs no knowledge of its internals, and it only ever touches values that are already wrong.
  */
-function* repair(check: Check, input: unknown, options: CoerceOptions): Generator<Checked | Promise<Checked>, CoerceResult, Checked> {
+function* repair(check: Check, input: unknown, options: CoerceOptions): Generator<Checked | PromiseLike<Checked>, CoerceResult, Checked> {
   const skip = new Set(options.skip);
   const maxChanges = options.maxChanges ?? 100;
   const changes: Change[] = [];
@@ -132,7 +136,8 @@ function* repair(check: Check, input: unknown, options: CoerceOptions): Generato
       const path = reachable(value, issue.path);
       if (!path) continue;
       const from = getAt(value, path);
-      for (const candidate of candidates(from, issue, typeof path.at(-1) === "string")) {
+      const isProperty = path.length > 0 && !Array.isArray(getAt(value, path.slice(0, -1)));
+      for (const candidate of candidates(from, issue, isProperty)) {
         if (skip.has(candidate.rule)) continue;
         const next = candidate.drop ? removeAt(value, path) : setAt(value, path, candidate.value);
         const after: Checked = yield check(next);
@@ -166,7 +171,9 @@ function reachable(root: unknown, path: Path): Path | undefined {
   let node = root;
   for (let i = 0; i < path.length; i++) {
     if (typeof node !== "object" || node === null) return path.slice(0, i);
-    node = (node as Record<string | number, unknown>)[path[i]!];
+    const key = path[i]!;
+    if (!Object.hasOwn(node, key)) return undefined;
+    node = (node as Record<string | number, unknown>)[key];
   }
   return node === undefined ? undefined : path;
 }
@@ -200,10 +207,21 @@ function candidates(value: unknown, issue: Problem, isProperty: boolean): Candid
   }
   if (typeof value === "boolean") return [{ rule: "boolean-to-string", value: String(value) }, wrap];
   if (value === null) return isProperty ? [{ rule: "drop-null", value: undefined, drop: true }] : [];
+  const json = toJsonString(value);
+  const asJson: Candidate[] = json === undefined ? [] : [{ rule: "to-json-string", value: json }];
   if (Array.isArray(value)) {
-    return [...(value.length === 1 ? [{ rule: "unwrap-array" as const, value: value[0] }] : []), { rule: "to-json-string", value: JSON.stringify(value) }];
+    return [...(value.length === 1 ? [{ rule: "unwrap-array" as const, value: value[0] }] : []), ...asJson];
   }
-  return [wrap, { rule: "to-json-string", value: JSON.stringify(value) }];
+  return [wrap, ...asJson];
+}
+
+function toJsonString(value: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(value);
+    return typeof json === "string" ? json : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function stringCandidates(value: string, issue: Problem, isProperty: boolean, wrap: Candidate): Candidate[] {
@@ -233,7 +251,7 @@ function stringCandidates(value: string, issue: Problem, isProperty: boolean, wr
 
 function enumMatches(text: string, issue: Problem): string[] {
   const key = (item: string) => item.toLowerCase().replace(/[\s_-]+/g, "");
-  if (issue.enum) return issue.enum.filter((item): item is string => typeof item === "string" && key(item) === key(text));
+  if (issue.enum) return issue.enum.filter((item): item is string => typeof item === "string" && item !== text && key(item) === key(text));
   const words = text.split(/[\s_-]+/);
   const forms = [text.toLowerCase(), text.toUpperCase(), text.charAt(0).toUpperCase() + text.slice(1).toLowerCase(), words.join("_").toLowerCase(), words.join("-").toLowerCase(), words.join("_").toUpperCase()];
   return [...new Set(forms)].filter((form) => form !== text);

@@ -12,17 +12,22 @@ type Node = { [keyword: string]: unknown };
 /** Checks what tool arguments usually get wrong: shapes and allowed values. */
 export function checkJsonSchema(schema: JsonSchema, value: unknown): Problem[] {
   const problems: Problem[] = [];
-  walk(schema, value, [], schema, problems);
+  walk(schema, value, [], schema, problems, new Set());
   return problems;
 }
 
-function walk(schema: JsonSchema | undefined, value: unknown, path: Path, root: JsonSchema, out: Problem[]): void {
+function walk(schema: JsonSchema | undefined, value: unknown, path: Path, root: JsonSchema, out: Problem[], seenRefs: Set<string>): void {
   if (schema === undefined || schema === true) return;
   if (schema === false) {
     out.push({ path, message: "not allowed" });
     return;
   }
-  if (typeof schema.$ref === "string") walk(resolve(schema.$ref, root), value, path, root, out);
+  if (typeof schema !== "object" || schema === null) return;
+  if (typeof schema.$ref === "string" && !seenRefs.has(schema.$ref)) {
+    const nextRefs = new Set(seenRefs);
+    nextRefs.add(schema.$ref);
+    walk(resolve(schema.$ref, root), value, path, root, out, nextRefs);
+  }
 
   const types = schema.type === undefined ? undefined : [schema.type].flat().concat(schema.nullable === true ? ["null"] : []);
   if (types && !types.some((type) => matchesType(type, value))) {
@@ -38,24 +43,29 @@ function walk(schema: JsonSchema | undefined, value: unknown, path: Path, root: 
     return;
   }
 
-  for (const branch of (schema.allOf ?? []) as JsonSchema[]) walk(branch, value, path, root, out);
-  const options = (schema.anyOf ?? schema.oneOf) as JsonSchema[] | undefined;
-  if (options) union(options, value, path, root, out);
+  for (const branch of (schema.allOf ?? []) as JsonSchema[]) walk(branch, value, path, root, out, seenRefs);
+  if (Array.isArray(schema.anyOf)) union(schema.anyOf as JsonSchema[], value, path, root, out, seenRefs);
+  if (Array.isArray(schema.oneOf)) union(schema.oneOf as JsonSchema[], value, path, root, out, seenRefs);
 
   if (Array.isArray(value)) walkArray(schema, value, path, root, out);
   else if (typeof value === "object" && value !== null) walkObject(schema, value as Node, path, root, out);
 }
 
 /** When the closest branch fails deeper down, report those failures, since they can be fixed. */
-function union(options: JsonSchema[], value: unknown, path: Path, root: JsonSchema, out: Problem[]): void {
+function union(options: JsonSchema[], value: unknown, path: Path, root: JsonSchema, out: Problem[], seenRefs: Set<string>): void {
+  if (options.length === 0) {
+    out.push({ path, message: "matches none of the allowed shapes" });
+    return;
+  }
   const results = options.map((option) => {
     const found: Problem[] = [];
-    walk(option, value, path, root, found);
+    walk(option, value, path, root, found, seenRefs);
     return found;
   });
   if (results.some((found) => found.length === 0)) return;
-  const closest = results.reduce((best, found) => (found.length < best.length ? found : best));
-  if (closest.every((item) => item.path.length > path.length)) {
+  const deep = results.filter((found) => found.every((item) => item.path.length > path.length));
+  if (deep.length > 0) {
+    const closest = deep.reduce((best, found) => (found.length < best.length ? found : best));
     out.push(...closest);
     return;
   }
@@ -66,18 +76,18 @@ function union(options: JsonSchema[], value: unknown, path: Path, root: JsonSche
 function walkObject(schema: Node, value: Node, path: Path, root: JsonSchema, out: Problem[]): void {
   const properties = (schema.properties ?? {}) as Record<string, JsonSchema>;
   for (const key of (schema.required ?? []) as string[]) {
-    if (value[key] === undefined) out.push({ path: [...path, key], message: "required" });
+    if (!Object.hasOwn(value, key) || value[key] === undefined) out.push({ path: [...path, key], message: "required" });
   }
   for (const [key, item] of Object.entries(value)) {
     const known = Object.hasOwn(properties, key);
-    if (known) walk(properties[key], item, [...path, key], root, out);
-    else if (schema.additionalProperties !== undefined) walk(schema.additionalProperties as JsonSchema, item, [...path, key], root, out);
+    if (known) walk(properties[key], item, [...path, key], root, out, new Set());
+    else if (schema.additionalProperties !== undefined) walk(schema.additionalProperties as JsonSchema, item, [...path, key], root, out, new Set());
   }
 }
 
 function walkArray(schema: Node, value: unknown[], path: Path, root: JsonSchema, out: Problem[]): void {
   const prefix = (schema.prefixItems ?? []) as JsonSchema[];
-  value.forEach((item, i) => walk(prefix[i] ?? (schema.items as JsonSchema | undefined), item, [...path, i], root, out));
+  value.forEach((item, i) => walk(prefix[i] ?? (schema.items as JsonSchema | undefined), item, [...path, i], root, out, new Set()));
 }
 
 function allowed(schema: Node): { enum?: unknown[] } {
@@ -86,9 +96,25 @@ function allowed(schema: Node): { enum?: unknown[] } {
 }
 
 function resolve(ref: string, root: JsonSchema): JsonSchema | undefined {
-  if (!ref.startsWith("#")) return true;
-  const parts = ref.slice(2).split("/").filter(Boolean);
-  return parts.reduce<any>((node, part) => node?.[part.replaceAll("~1", "/").replaceAll("~0", "~")], root);
+  if (ref === "#") return root;
+  if (!ref.startsWith("#/")) return true;
+  const parts = ref.slice(2).split("/");
+  let node: unknown = root;
+  for (const raw of parts) {
+    if (typeof node !== "object" || node === null) return undefined;
+    const part = decodePointer(raw).replaceAll("~1", "/").replaceAll("~0", "~");
+    if (!Object.hasOwn(node, part)) return undefined;
+    node = (node as Record<string, unknown>)[part];
+  }
+  return node as JsonSchema | undefined;
+}
+
+function decodePointer(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
 
 function matchesType(type: unknown, value: unknown): boolean {
@@ -112,5 +138,14 @@ function matchesType(type: unknown, value: unknown): boolean {
 }
 
 function equal(a: unknown, b: unknown): boolean {
-  return a === b || JSON.stringify(a) === JSON.stringify(b);
+  if (a === b) return true;
+  if (typeof a !== "object" || a === null || typeof b !== "object" || b === null) return false;
+  if (Array.isArray(a)) {
+    return Array.isArray(b) && a.length === b.length && a.every((item, i) => equal(item, b[i]));
+  }
+  if (Array.isArray(b)) return false;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((key) => Object.hasOwn(b, key) && equal((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]));
 }

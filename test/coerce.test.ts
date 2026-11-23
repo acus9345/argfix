@@ -107,6 +107,44 @@ describe("JSON Schema", () => {
     assert.deepEqual(result.value, { items: [{ qty: 1 }, { qty: 2 }], size: null, shape: { r: 3 } });
   });
 
+  it("fixes multi-field object branches in unions regardless of branch order", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        shape: {
+          oneOf: [
+            { type: "string", enum: ["none"] },
+            { type: "object", properties: { r: { type: "number" }, h: { type: "number" } } },
+          ],
+        },
+      },
+    };
+    const result = coerceSync(schema, { shape: { r: "3", h: "4" } });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.value, { shape: { r: 3, h: 4 } });
+  });
+
+  it("handles empty unions, cyclic $ref, and URI-encoded $ref safely", () => {
+    assert.equal(coerceSync({ anyOf: [] }, "x").ok, false);
+    assert.equal(coerceSync({ $ref: "#" }, "x").ok, true);
+    const cyclic = {
+      $defs: { a: { $ref: "#/$defs/b" }, b: { $ref: "#/$defs/a" } },
+      $ref: "#/$defs/a",
+    };
+    assert.equal(coerceSync(cyclic, "x").ok, true);
+    const encoded = {
+      type: "object",
+      $defs: { "my item": { type: "integer" } },
+      properties: { count: { $ref: "#/$defs/my%20item" } },
+    };
+    assert.deepEqual(coerceSync(encoded, { count: "7" }).value, { count: 7 });
+  });
+
+  it("checks enum and const equality structurally without confusing NaN with null", () => {
+    assert.equal(coerceSync({ enum: [null] }, Number.NaN).ok, false);
+    assert.equal(coerceSync({ const: { a: 1, b: 2 } }, { b: 2, a: 1 }).ok, true);
+  });
+
   it("handles other shapes of mistake", () => {
     const schema = {
       type: "object",
@@ -153,18 +191,38 @@ describe("JSON Schema", () => {
     assert.equal(coerceSync(toolSchema, { query: "a", limit: 1, extra: 1 }).ok, false);
   });
 
-  it("isn't fooled by a __proto__ key", () => {
+  it("isn't fooled by a __proto__ key or inherited prototype properties", () => {
     const input = JSON.parse('{"__proto__":{"polluted":"1"},"limit":"1","query":"a"}');
     const schema = { type: "object", additionalProperties: { type: "object", properties: { polluted: { type: "number" } } } };
     const result = coerceSync(schema, input);
     assert.equal(({} as { polluted?: unknown }).polluted, undefined);
     assert.equal(result.ok, false);
+
+    const protoRequired = { type: "object", required: ["toString"], properties: { toString: { type: "string" } } };
+    const missing = coerceSync(protoRequired, {});
+    assert.equal(missing.ok, false);
+    assert.deepEqual(missing.changes, []);
+    assert.deepEqual(missing.issues.map((issue) => issue.path), [["toString"]]);
+  });
+
+  it("doesn't throw on unserializable values like circular objects or BigInt", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    assert.equal(coerceSync({ type: "string" }, circular).ok, false);
+    assert.equal(coerceSync({ type: "string" }, 1n).ok, false);
   });
 });
 
 describe("options", () => {
   it("skips rules", () => {
     const result = coerceSync(toolSchema, { query: "a", limit: "5" }, { skip: ["string-to-number"] });
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.changes, []);
+  });
+
+  it("respects skip: ['trim'] on enum values", () => {
+    const schema = { type: "object", properties: { state: { enum: ["high"] } } };
+    const result = coerceSync(schema, { state: " high " }, { skip: ["trim"] });
     assert.equal(result.ok, false);
     assert.deepEqual(result.changes, []);
   });
@@ -241,5 +299,49 @@ describe("Standard Schema", () => {
     };
     assert.equal((await coerce(schema, "1")).value, 1);
     assert.throws(() => coerceSync(schema, "1"), /Use coerce\(\)/);
+  });
+
+  it("works with a custom thenable Standard Schema", async () => {
+    const schema = {
+      "~standard": {
+        validate: (value: unknown) => ({
+          then<TResult1 = { value?: unknown; issues?: { message: string; path: (string | number)[] }[] }, TResult2 = never>(
+            onfulfilled?: ((res: { value?: unknown; issues?: { message: string; path: (string | number)[] }[] }) => TResult1 | PromiseLike<TResult1>) | null,
+            onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+          ): PromiseLike<TResult1 | TResult2> {
+            const res = value === 1 ? { value } : { issues: [{ message: "bad", path: [] }] };
+            return Promise.resolve(res).then(onfulfilled, onrejected);
+          },
+        }),
+      },
+    };
+    assert.equal((await coerce(schema, "1")).value, 1);
+    assert.throws(() => coerceSync(schema, "1"), /Use coerce\(\)/);
+  });
+
+  it("preserves output when a Standard Schema returns an empty issues array", () => {
+    const schema = {
+      "~standard": {
+        validate: (value: unknown) => ({ value: { wrapped: value }, issues: [] }),
+      },
+    };
+    const result = coerceSync(schema, 42);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.output, { wrapped: 42 });
+  });
+
+  it("does not drop elements from arrays when an issue reports a stringified index", () => {
+    const schema = {
+      "~standard": {
+        validate: (value: unknown) =>
+          Array.isArray(value) && value.every((item) => typeof item === "string")
+            ? { value }
+            : { issues: [{ message: "expected string", path: ["0"] }] },
+      },
+    };
+    const result = coerceSync(schema, [null]);
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.value, [null]);
+    assert.deepEqual(result.changes, []);
   });
 });
